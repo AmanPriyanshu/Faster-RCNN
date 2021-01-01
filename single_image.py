@@ -9,7 +9,7 @@ import cv2
 from PIL import Image
 
 SHOW_IMAGES = False
-IMAGE_NO = 1
+IMAGE_NO = 2
 IMAGE_NO = str(IMAGE_NO)
 
 ### Enabling CUDA
@@ -188,4 +188,159 @@ index_inside = np.where(
 print("Number of Boxes with Boundary:", index_inside.shape)
 
 valid_anchor_boxes = anchor_boxes[index_inside]
-print("Valid Anchor Boxes Left:", valid_anchor_boxes.shape)
+print("Valid Anchor Boxes Left:", valid_anchor_boxes.shape, "\n\n")
+
+### Calculate iou of the valid anchor boxes 
+
+# IOU = intersection(A, Y)/Union(A, Y)
+# Since we have 8940 anchor boxes and 1 ground truth object, we should get an array with (8490, 1) as the output. 
+ious = np.empty((len(valid_anchor_boxes), len(bbox)), dtype=np.float32)
+ious.fill(0)
+for num1, i in enumerate(valid_anchor_boxes):
+	xa1, ya1, xa2, ya2 = i  
+	anchor_area = (ya2 - ya1) * (xa2 - xa1)
+	for num2, j in enumerate(bbox):
+		yb1, xb1, yb2, xb2 = j
+		box_area = (yb2 - yb1) * (xb2 - xb1)
+		inter_x1 = max([xb1, xa1])
+		inter_y1 = max([yb1, ya1])
+		inter_x2 = min([xb2, xa2])
+		inter_y2 = min([yb2, ya2])
+		if (inter_x1 < inter_x2) and (inter_y1 < inter_y2):
+			iter_area = (inter_y2 - inter_y1) * (inter_x2 - inter_x1)
+			iou = iter_area / (anchor_area + box_area - iter_area)			
+		else:
+			iou = 0.
+		ious[num1, num2] = iou
+print("IOU of generated Anchor Boxes:", ious.shape)
+
+# What anchor box has max iou with the ground truth bbox  
+gt_argmax_ious = ious.argmax(axis=0)
+print("Index of Maximum IOU with ground truth box:", gt_argmax_ious)
+
+gt_max_ious = ious[gt_argmax_ious, np.arange(ious.shape[1])]
+print("Maximum IOU with ground truth box:", gt_max_ious)
+
+gt_argmax_ious = np.where(ious == gt_max_ious)[0]
+print("Other indexes with same IOU:", gt_argmax_ious)
+
+# What ground truth bbox is associated with each anchor box 
+argmax_ious = ious.argmax(axis=1)
+print("Ground Truth Box Associated with each Anchor Box - shape:", argmax_ious.shape)
+print("Ground Truth Box Associated with each Anchor Box - values:",argmax_ious)
+max_ious = ious[np.arange(len(index_inside)), argmax_ious]
+print("Max IOUs:", max_ious, "\n\n")
+
+### Labelling:
+label = np.ones((len(index_inside), ), dtype=np.int32) * -1
+print("Labels Shape", label.shape)
+
+# Use iou to assign 1 (objects) to two kind of anchors 
+# a) The anchors with the highest iou overlap with a ground-truth-box
+# b) An anchor that has an IoU overlap higher than 0.6 with ground-truth box
+
+# Assign 0 (background) to an anchor if its IoU ratio is lower than 0.3 for all ground-truth boxes
+pos_iou_threshold  = 0.6
+neg_iou_threshold = 0.3
+label[gt_argmax_ious] = 1
+label[max_ious >= pos_iou_threshold] = 1
+label[max_ious < neg_iou_threshold] = 0
+
+print("After Labelling:", label, "\n\n")
+
+### Batches - Ignoring: -1, Positive: 1, Negative: 0
+
+n_sample = 256
+pos_ratio = 0.5
+n_pos = pos_ratio * n_sample
+
+pos_index = np.where(label == 1)[0]
+if len(pos_index) > n_pos:
+	disable_index = np.random.choice(pos_index, size=(len(pos_index) - n_pos), replace=False)
+	label[disable_index] = -1
+	
+n_neg = n_sample * np.sum(label == 1)
+neg_index = np.where(label == 0)[0]
+if len(neg_index) > n_neg:
+	disable_index = np.random.choice(neg_index, size=(len(neg_index) - n_neg), replace = False)
+	label[disable_index] = -1
+
+print("1s chosen:",np.where(label==1)[0].shape[0], "| 0s chosen:", np.where(label==0)[0].shape[0], "| Ignored Chosen:", np.where(label==-1)[0].shape[0], "\n\n")
+
+### LOCS
+# For each valid anchor box, find the groundtruth object which has max_iou 
+max_iou_bbox = bbox[argmax_ious]
+print("Max IOU BBOX:", max_iou_bbox.shape)
+
+# valid anchor boxes h, w, cx, cy 
+width = valid_anchor_boxes[:, 2] - valid_anchor_boxes[:, 0]
+height = valid_anchor_boxes[:, 3] - valid_anchor_boxes[:, 1]
+ctr_y = valid_anchor_boxes[:, 1] + 0.5 * height
+ctr_x = valid_anchor_boxes[:, 0] + 0.5 * width
+
+# valid anchor box max iou bbox h, w, cx, cy 
+base_width = max_iou_bbox[:, 2] - max_iou_bbox[:, 0]
+base_height = max_iou_bbox[:, 3] - max_iou_bbox[:, 1]
+base_ctr_y = max_iou_bbox[:, 1] + 0.5 * base_height
+base_ctr_x = max_iou_bbox[:, 0] + 0.5 * base_width
+
+# valid anchor boxes  loc = (y-ya/ha), (x-xa/wa), log(h/ha), log(w/wa)
+eps = np.finfo(height.dtype).eps
+height = np.maximum(height, eps) # height !=0
+width = np.maximum(width, eps)
+dy = (base_ctr_y - ctr_y) / height
+dx = (base_ctr_x - ctr_x) / width
+dh = np.log(base_height / height)
+dw = np.log(base_width / width)
+anchor_locs = np.vstack((dy, dx, dh, dw)).transpose()
+print("Anchor Locs:",anchor_locs.shape)
+
+anchor_labels = np.empty((len(anchor_boxes),), dtype=label.dtype)
+anchor_labels.fill(-1)
+anchor_labels[index_inside] = label
+print("Anchor Labels:", anchor_labels.shape)
+
+anchor_locations = np.empty((len(anchor_boxes),) + anchor_boxes.shape[1:], dtype=anchor_locs.dtype)
+anchor_locations.fill(0)
+anchor_locations[index_inside, :] = anchor_locs
+print("Anchor Locations:", anchor_locations.shape, "\n\n")
+
+### RPN and ROI:
+
+in_channels = 512 # depends on the output feature map. in vgg 16 it is equal to 512
+mid_channels = 512
+n_anchor = 9  # Number of anchors at each location
+
+conv1 = nn.Conv2d(in_channels, mid_channels, 3, 1, 1).to(device)
+conv1.weight.data.normal_(0, 0.01)
+conv1.bias.data.zero_()
+
+reg_layer = nn.Conv2d(mid_channels, n_anchor *4, 1, 1, 0).to(device)
+reg_layer.weight.data.normal_(0, 0.01)
+reg_layer.bias.data.zero_()
+
+cls_layer = nn.Conv2d(mid_channels, n_anchor *2, 1, 1, 0).to(device) ## I will be going to use softmax here. you can equally use sigmoid if u replace 2 with 1.
+cls_layer.weight.data.normal_(0, 0.01)
+cls_layer.bias.data.zero_()
+
+x = conv1(out_map.to(device)) # out_map = faster_rcnn_fe_extractor(imgTensor)
+pred_anchor_locs = reg_layer(x)
+pred_cls_scores = cls_layer(x)
+
+# RPN anchor box format 
+# [1, 36(9*4), 50, 50] => [1, 22500(50*50*9), 4] (dy, dx, dh, dw)
+# [1, 18(9*2), 50, 50] => [1, 22500, 2]  (1, 0)
+pred_anchor_locs = pred_anchor_locs.permute(0, 2, 3, 1).contiguous().view(1, -1, 4)
+print("Locs Predction:", pred_anchor_locs.shape)
+
+pred_cls_scores = pred_cls_scores.permute(0, 2, 3, 1).contiguous()
+print("Classification Scores Prediction:", pred_cls_scores.shape)
+
+objectness_score = pred_cls_scores.view(1, 50, 50, 9, 2)[:, :, :, :, 1].contiguous().view(1, -1)
+print("Objectness Format:", objectness_score.shape)
+
+pred_cls_scores  = pred_cls_scores.view(1, -1, 2)
+print("Readable Format:", pred_cls_scores.shape)
+
+### ROI and RPN Loss:
+
